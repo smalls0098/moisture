@@ -5,7 +5,7 @@ use quote::{quote, ToTokens};
 use std::collections::HashMap;
 
 use syn::*;
-use syn::parse::{Parse, Parser, ParseStream};
+use syn::parse::Parser;
 use syn::spanned::Spanned;
 
 #[cfg(test)]
@@ -136,17 +136,52 @@ pub enum CallbackType {
     Verbatim,
 }
 
+#[derive(Clone, Debug)]
+pub struct Context {
+    stack: Vec<(CallbackType, TokenStream)>,
+}
+impl Context {
+    pub fn new() -> Self {
+        Self { stack: Vec::<(CallbackType, TokenStream)>::new() }
+    }
+    pub fn push(&mut self, ty: CallbackType, tokens: TokenStream) {
+        self.stack.push((ty, tokens));
+    }
+    pub fn pop(&mut self) -> Option<(CallbackType, TokenStream)> {
+        self.stack.pop()
+    }
+    pub fn peek(&self, distance: usize) -> Option<(CallbackType, TokenStream)> {
+        if self.stack.len() == 0 || distance >= self.stack.len() { None }
+        else { let entry = &self.stack[self.stack.len()-distance-1]; Some(entry.clone()) }
+    }
+}
+
 /// The callback function to register with the [`Moisture`](Moisture) structure.
-pub type Callback = fn(&Moisture, TokenStream) -> Result<TokenStream>;
+pub type Callback = fn(&Moisture, &Context, TokenStream) -> Result<TokenStream>;
 
 #[macro_export]
 macro_rules! run_moisture {
     ($moisture:ident, $callback_ty:path, $tokens:ident) => {
-        match $moisture.callback($callback_ty, $tokens) {
+        match $moisture.callback(&Context::new(), $callback_ty, $tokens) {
             Ok(new_tokens) => new_tokens,
             Err(e) => e.to_compile_error(),
         }
     };
+}
+
+fn get_pat_type(tokens: TokenStream) -> Result<PatType> {
+    let stub = quote! { let #tokens ; };
+    let stmt = parse2::<Stmt>(stub)?;
+    let stmt_span = stmt.span().clone();
+    let local_data;
+
+    if let Stmt::Local(local) = stmt {
+        local_data = local;
+    }
+    else { return Err(Error::new(stmt_span, "expected Local statement in PatType interpretation")); }
+
+    if let Pat::Type(pat) = local_data.pat { Ok(pat) }
+    else { Err(Error::new(stmt_span, "expected PatType object in Local statement pattern")) }
 }
 
 #[derive(Clone)]
@@ -284,15 +319,18 @@ impl Moisture {
     pub fn register_callback(&mut self, ty: CallbackType, callback: Callback) {
         self.callbacks.insert(ty, callback);
     }
-    pub fn callback(&self, ty: CallbackType, tokens: TokenStream) -> Result<TokenStream> {
+    pub fn callback(&self, context: &Context, ty: CallbackType, tokens: TokenStream) -> Result<TokenStream> {
         if let Some(callback) = self.callbacks.get(&ty) {
-            let result = callback(self, tokens)?;
+            let mut new_context = context.clone();
+            new_context.push(ty, tokens.clone());
+            
+            let result = callback(self, &new_context, tokens)?;
 
             Ok(result)
         }
         else { Err(Error::new(Span::call_site(), format!("couldn't find function for callback type {:?}", ty))) }
     }
-    pub fn file(&self, tokens: TokenStream) -> Result<TokenStream> {
+    pub fn file(&self, context: &Context, tokens: TokenStream) -> Result<TokenStream> {
         let parsed = parse2::<File>(tokens)?;
         let mut tokens = TokenStream::new();
         
@@ -307,7 +345,7 @@ impl Moisture {
         let mut new_items = Vec::<TokenStream>::new();
 
         for item in &parsed.items {
-            let item_stream = self.callback(CallbackType::Item, item.to_token_stream())?;
+            let item_stream = self.callback(context, CallbackType::Item, item.to_token_stream())?;
             new_items.push(item_stream);
         }
 
@@ -316,34 +354,34 @@ impl Moisture {
         Ok(tokens)
     }
 
-    pub fn item(&self, tokens: TokenStream) -> Result<TokenStream> {
+    pub fn item(&self, context: &Context, tokens: TokenStream) -> Result<TokenStream> {
         let parsed = parse2::<Item>(tokens)?;
         
         let result = match parsed {
-            Item::Const(ref const_) => self.callback(CallbackType::ItemConst, const_.to_token_stream()),
-            Item::Enum(ref enum_) => self.callback(CallbackType::ItemEnum, enum_.to_token_stream()),
-            Item::ExternCrate(ref crate_) => self.callback(CallbackType::ItemExternCrate, crate_.to_token_stream()),
-            Item::Fn(ref fn_) => self.callback(CallbackType::ItemFn, fn_.to_token_stream()),
-            Item::ForeignMod(ref mod_) => self.callback(CallbackType::ItemForeignMod, mod_.to_token_stream()),
-            Item::Impl(ref impl_) => self.callback(CallbackType::ItemImpl, impl_.to_token_stream()),
-            Item::Macro(ref macro_) => self.callback(CallbackType::ItemMacro, macro_.to_token_stream()),
-            Item::Macro2(ref macro_) => self.callback(CallbackType::ItemMacro2, macro_.to_token_stream()),
-            Item::Mod(ref mod_) => self.callback(CallbackType::ItemMod, mod_.to_token_stream()),
-            Item::Static(ref static_) => self.callback(CallbackType::ItemStatic, static_.to_token_stream()),
-            Item::Struct(ref struct_) => self.callback(CallbackType::ItemStruct, struct_.to_token_stream()),
-            Item::Trait(ref trait_) => self.callback(CallbackType::ItemTrait, trait_.to_token_stream()),
-            Item::TraitAlias(ref alias) => self.callback(CallbackType::ItemTraitAlias, alias.to_token_stream()),
-            Item::Type(ref type_) => self.callback(CallbackType::ItemType, type_.to_token_stream()),
-            Item::Union(ref union) => self.callback(CallbackType::ItemUnion, union.to_token_stream()),
-            Item::Use(ref use_) => self.callback(CallbackType::ItemUse, use_.to_token_stream()),
+            Item::Const(ref const_) => self.callback(context, CallbackType::ItemConst, const_.to_token_stream()),
+            Item::Enum(ref enum_) => self.callback(context, CallbackType::ItemEnum, enum_.to_token_stream()),
+            Item::ExternCrate(ref crate_) => self.callback(context, CallbackType::ItemExternCrate, crate_.to_token_stream()),
+            Item::Fn(ref fn_) => self.callback(context, CallbackType::ItemFn, fn_.to_token_stream()),
+            Item::ForeignMod(ref mod_) => self.callback(context, CallbackType::ItemForeignMod, mod_.to_token_stream()),
+            Item::Impl(ref impl_) => self.callback(context, CallbackType::ItemImpl, impl_.to_token_stream()),
+            Item::Macro(ref macro_) => self.callback(context, CallbackType::ItemMacro, macro_.to_token_stream()),
+            Item::Macro2(ref macro_) => self.callback(context, CallbackType::ItemMacro2, macro_.to_token_stream()),
+            Item::Mod(ref mod_) => self.callback(context, CallbackType::ItemMod, mod_.to_token_stream()),
+            Item::Static(ref static_) => self.callback(context, CallbackType::ItemStatic, static_.to_token_stream()),
+            Item::Struct(ref struct_) => self.callback(context, CallbackType::ItemStruct, struct_.to_token_stream()),
+            Item::Trait(ref trait_) => self.callback(context, CallbackType::ItemTrait, trait_.to_token_stream()),
+            Item::TraitAlias(ref alias) => self.callback(context, CallbackType::ItemTraitAlias, alias.to_token_stream()),
+            Item::Type(ref type_) => self.callback(context, CallbackType::ItemType, type_.to_token_stream()),
+            Item::Union(ref union) => self.callback(context, CallbackType::ItemUnion, union.to_token_stream()),
+            Item::Use(ref use_) => self.callback(context, CallbackType::ItemUse, use_.to_token_stream()),
             
-            Item::Verbatim(ref vert_tokens) => self.callback(CallbackType::Verbatim, vert_tokens.clone()),
+            Item::Verbatim(ref vert_tokens) => self.callback(context, CallbackType::Verbatim, vert_tokens.clone()),
             _ => Ok(parsed.to_token_stream()),
         }?;
 
         Ok(result)
     }
-    pub fn item_const(&self, tokens: TokenStream) -> Result<TokenStream> {
+    pub fn item_const(&self, context: &Context, tokens: TokenStream) -> Result<TokenStream> {
         let ItemConst {
             attrs,
             vis,
@@ -362,7 +400,7 @@ impl Moisture {
             #vis #const_token #ident #colon_token #ty #eq_token
         });
         
-        let filtered_expr = self.callback(CallbackType::Expr, expr.to_token_stream())?;
+        let filtered_expr = self.callback(context, CallbackType::Expr, expr.to_token_stream())?;
         tokens.push(filtered_expr);
         
         tokens.push(quote! { #semi_token });
@@ -370,7 +408,7 @@ impl Moisture {
         result.extend(tokens.into_iter());
         Ok(result)
     }
-    pub fn item_enum(&self, tokens: TokenStream) -> Result<TokenStream> {
+    pub fn item_enum(&self, context: &Context, tokens: TokenStream) -> Result<TokenStream> {
         let ItemEnum {
             attrs,
             vis,
@@ -390,7 +428,7 @@ impl Moisture {
         let mut filtered_variants = Vec::<TokenStream>::new();
 
         for variant in &variants {
-            let new_variant = self.callback(CallbackType::Variant, variant.to_token_stream())?;
+            let new_variant = self.callback(context, CallbackType::Variant, variant.to_token_stream())?;
             filtered_variants.push(new_variant);
         }
 
@@ -403,7 +441,7 @@ impl Moisture {
         result.extend(tokens.into_iter());
         Ok(result)
     }
-    pub fn variant(&self, tokens: TokenStream) -> Result<TokenStream> {
+    pub fn variant(&self, context: &Context, tokens: TokenStream) -> Result<TokenStream> {
         let Variant {
             attrs,
             ident,
@@ -418,7 +456,7 @@ impl Moisture {
         });
 
         if let Some((eq_token, expr)) = discriminant {
-            let filtered_expr = self.callback(CallbackType::Expr, expr.to_token_stream())?;
+            let filtered_expr = self.callback(context, CallbackType::Expr, expr.to_token_stream())?;
 
             tokens.push(quote! { #eq_token #filtered_expr });
         }
@@ -426,13 +464,13 @@ impl Moisture {
         result.extend(tokens.into_iter());
         Ok(result)
     }
-    pub fn item_extern_crate(&self, tokens: TokenStream) -> Result<TokenStream> {
+    pub fn item_extern_crate(&self, _: &Context, tokens: TokenStream) -> Result<TokenStream> {
         // nothing to expand for now, essentially a no-op to parse the type and turn
         // it back into tokens
         let parsed = parse2::<ItemExternCrate>(tokens)?;
         Ok(parsed.to_token_stream())
     }
-    pub fn item_fn(&self, tokens: TokenStream) -> Result<TokenStream> {
+    pub fn item_fn(&self, context: &Context, tokens: TokenStream) -> Result<TokenStream> {
         let ItemFn {
             attrs,
             vis,
@@ -446,13 +484,13 @@ impl Moisture {
             #vis #sig
         });
         
-        let filtered_block = self.callback(CallbackType::Block, block.to_token_stream())?;
+        let filtered_block = self.callback(context, CallbackType::Block, block.to_token_stream())?;
         tokens.push(filtered_block);
 
         result.extend(tokens.into_iter());
         Ok(result)
     }
-    pub fn item_foreign_mod(&self, tokens: TokenStream) -> Result<TokenStream> {
+    pub fn item_foreign_mod(&self, context: &Context, tokens: TokenStream) -> Result<TokenStream> {
         let ItemForeignMod {
             attrs,
             abi,
@@ -469,7 +507,7 @@ impl Moisture {
         let mut filtered_items = Vec::<TokenStream>::new();
 
         for item in &items {
-            let filtered = self.callback(CallbackType::ForeignItem, item.to_token_stream())?;
+            let filtered = self.callback(context, CallbackType::ForeignItem, item.to_token_stream())?;
             filtered_items.push(filtered);
         }
 
@@ -478,7 +516,7 @@ impl Moisture {
         result.extend(tokens.into_iter());
         Ok(result)
     }
-    pub fn item_impl(&self, tokens: TokenStream) -> Result<TokenStream> {
+    pub fn item_impl(&self, context: &Context, tokens: TokenStream) -> Result<TokenStream> {
         let ItemImpl {
             attrs,
             defaultness,
@@ -519,7 +557,7 @@ impl Moisture {
         let mut filtered_items = Vec::<TokenStream>::new();
 
         for item in &items {
-            let filtered_item = self.callback(CallbackType::ImplItem, item.to_token_stream())?;
+            let filtered_item = self.callback(context, CallbackType::ImplItem, item.to_token_stream())?;
             filtered_items.push(filtered_item);
         }
 
@@ -532,15 +570,15 @@ impl Moisture {
         result.extend(tokens.into_iter());
         Ok(result)
     }
-    pub fn item_macro(&self, tokens: TokenStream) -> Result<TokenStream> {
+    pub fn item_macro(&self, _: &Context, tokens: TokenStream) -> Result<TokenStream> {
         let parsed = parse2::<ItemMacro>(tokens)?;
         Ok(parsed.to_token_stream())
     }
-    pub fn item_macro2(&self, tokens: TokenStream) -> Result<TokenStream> {
+    pub fn item_macro2(&self, _: &Context, tokens: TokenStream) -> Result<TokenStream> {
         let parsed = parse2::<ItemMacro2>(tokens)?;
         Ok(parsed.to_token_stream())
     }
-    pub fn item_mod(&self, tokens: TokenStream) -> Result<TokenStream> {
+    pub fn item_mod(&self, context: &Context, tokens: TokenStream) -> Result<TokenStream> {
         let ItemMod {
             attrs,
             vis,
@@ -560,7 +598,7 @@ impl Moisture {
             let mut filtered_items = Vec::<TokenStream>::new();
 
             for item in &items {
-                let new_item = self.callback(CallbackType::Item, item.to_token_stream())?;
+                let new_item = self.callback(context, CallbackType::Item, item.to_token_stream())?;
                 filtered_items.push(new_item);
             }
 
@@ -574,7 +612,7 @@ impl Moisture {
         result.extend(tokens.into_iter());
         Ok(result)
     }
-    pub fn item_static(&self, tokens: TokenStream) -> Result<TokenStream> {
+    pub fn item_static(&self, context: &Context, tokens: TokenStream) -> Result<TokenStream> {
         let ItemStatic {
             attrs,
             vis,
@@ -600,17 +638,17 @@ impl Moisture {
 
         tokens.push(quote! { #ident #colon_token #ty #eq_token });
 
-        let filtered_expr = self.callback(CallbackType::Expr, expr.to_token_stream())?;
+        let filtered_expr = self.callback(context, CallbackType::Expr, expr.to_token_stream())?;
         tokens.push(quote! { #filtered_expr #semi_token });
 
         result.extend(tokens.into_iter());
         Ok(result)
     }
-    pub fn item_struct(&self, tokens: TokenStream) -> Result<TokenStream> {
+    pub fn item_struct(&self, _: &Context, tokens: TokenStream) -> Result<TokenStream> {
         let parsed = parse2::<ItemStruct>(tokens)?;
         Ok(parsed.to_token_stream())
     }
-    pub fn item_trait(&self, tokens: TokenStream) -> Result<TokenStream> {
+    pub fn item_trait(&self, context: &Context, tokens: TokenStream) -> Result<TokenStream> {
         let ItemTrait {
             attrs,
             vis,
@@ -653,7 +691,7 @@ impl Moisture {
         let mut trait_items = Vec::<TokenStream>::new();
 
         for item in &items {
-            let new_item = self.callback(CallbackType::TraitItem, item.to_token_stream())?;
+            let new_item = self.callback(context, CallbackType::TraitItem, item.to_token_stream())?;
             trait_items.push(new_item);
         }
 
@@ -666,65 +704,65 @@ impl Moisture {
         result.extend(tokens.into_iter());
         Ok(result)
     }
-    pub fn item_trait_alias(&self, tokens: TokenStream) -> Result<TokenStream> {
+    pub fn item_trait_alias(&self, _: &Context, tokens: TokenStream) -> Result<TokenStream> {
         let parsed = parse2::<ItemTraitAlias>(tokens)?;
         Ok(parsed.to_token_stream())
     }
-    pub fn item_type(&self, tokens: TokenStream) -> Result<TokenStream> {
+    pub fn item_type(&self, _: &Context, tokens: TokenStream) -> Result<TokenStream> {
         let parsed = parse2::<ItemType>(tokens)?;
         Ok(parsed.to_token_stream())
     }
-    pub fn item_union(&self, tokens: TokenStream) -> Result<TokenStream> {
+    pub fn item_union(&self, _: &Context, tokens: TokenStream) -> Result<TokenStream> {
         let parsed = parse2::<ItemUnion>(tokens)?;
         Ok(parsed.to_token_stream())
     }
-    pub fn item_use(&self, tokens: TokenStream) -> Result<TokenStream> {
+    pub fn item_use(&self, _: &Context, tokens: TokenStream) -> Result<TokenStream> {
         let parsed = parse2::<ItemUse>(tokens)?;
         Ok(parsed.to_token_stream())
     }
-    pub fn foreign_item(&self, tokens: TokenStream) -> Result<TokenStream> {
+    pub fn foreign_item(&self, context: &Context, tokens: TokenStream) -> Result<TokenStream> {
         let parsed = parse2::<ForeignItem>(tokens)?;
 
         let result = match parsed {
-            ForeignItem::Fn(ref fn_) => self.callback(CallbackType::ForeignItemFn, fn_.to_token_stream()),
-            ForeignItem::Static(ref static_) => self.callback(CallbackType::ForeignItemStatic, static_.to_token_stream()),
-            ForeignItem::Type(ref type_) => self.callback(CallbackType::ForeignItemType, type_.to_token_stream()),
-            ForeignItem::Macro(ref macro_) => self.callback(CallbackType::ForeignItemMacro, macro_.to_token_stream()),
-            ForeignItem::Verbatim(ref verbatim) => self.callback(CallbackType::Verbatim, verbatim.clone()),
+            ForeignItem::Fn(ref fn_) => self.callback(context, CallbackType::ForeignItemFn, fn_.to_token_stream()),
+            ForeignItem::Static(ref static_) => self.callback(context, CallbackType::ForeignItemStatic, static_.to_token_stream()),
+            ForeignItem::Type(ref type_) => self.callback(context, CallbackType::ForeignItemType, type_.to_token_stream()),
+            ForeignItem::Macro(ref macro_) => self.callback(context, CallbackType::ForeignItemMacro, macro_.to_token_stream()),
+            ForeignItem::Verbatim(ref verbatim) => self.callback(context, CallbackType::Verbatim, verbatim.clone()),
             _ => Ok(parsed.to_token_stream()),
         }?;
         Ok(result)
     }
-    pub fn foreign_item_fn(&self, tokens: TokenStream) -> Result<TokenStream> {
+    pub fn foreign_item_fn(&self, _: &Context, tokens: TokenStream) -> Result<TokenStream> {
         let parsed = parse2::<ForeignItemFn>(tokens)?;
         Ok(parsed.to_token_stream())
     }
-    pub fn foreign_item_static(&self, tokens: TokenStream) -> Result<TokenStream> {
+    pub fn foreign_item_static(&self, _: &Context, tokens: TokenStream) -> Result<TokenStream> {
         let parsed = parse2::<ForeignItemStatic>(tokens)?;
         Ok(parsed.to_token_stream())
     }
-    pub fn foreign_item_type(&self, tokens: TokenStream) -> Result<TokenStream> {
+    pub fn foreign_item_type(&self, _: &Context, tokens: TokenStream) -> Result<TokenStream> {
         let parsed = parse2::<ForeignItemType>(tokens)?;
         Ok(parsed.to_token_stream())
     }
-    pub fn foreign_item_macro(&self, tokens: TokenStream) -> Result<TokenStream> {
+    pub fn foreign_item_macro(&self, _: &Context, tokens: TokenStream) -> Result<TokenStream> {
         let parsed = parse2::<ForeignItemMacro>(tokens)?;
         Ok(parsed.to_token_stream())
     }
-    pub fn impl_item(&self, tokens: TokenStream) -> Result<TokenStream> {
+    pub fn impl_item(&self, context: &Context, tokens: TokenStream) -> Result<TokenStream> {
         let parsed = parse2::<ImplItem>(tokens)?;
 
         let result = match parsed {
-            ImplItem::Const(ref const_) => self.callback(CallbackType::ImplItemConst, const_.to_token_stream()),
-            ImplItem::Method(ref method) => self.callback(CallbackType::ImplItemMethod, method.to_token_stream()),
-            ImplItem::Type(ref type_) => self.callback(CallbackType::ImplItemType, type_.to_token_stream()),
-            ImplItem::Macro(ref macro_) => self.callback(CallbackType::ImplItemMacro, macro_.to_token_stream()),
-            ImplItem::Verbatim(ref verbatim) => self.callback(CallbackType::Verbatim, verbatim.clone()),
+            ImplItem::Const(ref const_) => self.callback(context, CallbackType::ImplItemConst, const_.to_token_stream()),
+            ImplItem::Method(ref method) => self.callback(context, CallbackType::ImplItemMethod, method.to_token_stream()),
+            ImplItem::Type(ref type_) => self.callback(context, CallbackType::ImplItemType, type_.to_token_stream()),
+            ImplItem::Macro(ref macro_) => self.callback(context, CallbackType::ImplItemMacro, macro_.to_token_stream()),
+            ImplItem::Verbatim(ref verbatim) => self.callback(context, CallbackType::Verbatim, verbatim.clone()),
             _ => Ok(parsed.to_token_stream()),
         }?;
         Ok(result)
     }
-    pub fn impl_item_const(&self, tokens: TokenStream) -> Result<TokenStream> {
+    pub fn impl_item_const(&self, context: &Context, tokens: TokenStream) -> Result<TokenStream> {
         let ImplItemConst {
             attrs,
             vis,
@@ -747,14 +785,14 @@ impl Moisture {
 
         tokens.push(quote! { #const_token #ident #colon_token #ty #eq_token });
 
-        let filtered_expr = self.callback(CallbackType::Expr, expr.to_token_stream())?;
+        let filtered_expr = self.callback(context, CallbackType::Expr, expr.to_token_stream())?;
 
         tokens.push(quote! { #filtered_expr #semi_token });
 
         result.extend(tokens.into_iter());
         Ok(result)
     }
-    pub fn impl_item_method(&self, tokens: TokenStream) -> Result<TokenStream> {
+    pub fn impl_item_method(&self, context: &Context, tokens: TokenStream) -> Result<TokenStream> {
         let ImplItemMethod {
             attrs,
             vis,
@@ -772,34 +810,34 @@ impl Moisture {
 
         tokens.push(quote! { #sig });
 
-        let filtered_block = self.callback(CallbackType::Block, block.to_token_stream())?;
+        let filtered_block = self.callback(context, CallbackType::Block, block.to_token_stream())?;
         tokens.push(quote! { #filtered_block });
 
         result.extend(tokens.into_iter());
         Ok(result)
     }
-    pub fn impl_item_type(&self, tokens: TokenStream) -> Result<TokenStream> {
+    pub fn impl_item_type(&self, _: &Context, tokens: TokenStream) -> Result<TokenStream> {
         let parsed = parse2::<ImplItemType>(tokens)?;
         Ok(parsed.to_token_stream())
     }
-    pub fn impl_item_macro(&self, tokens: TokenStream) -> Result<TokenStream> {
+    pub fn impl_item_macro(&self, _: &Context, tokens: TokenStream) -> Result<TokenStream> {
         let parsed = parse2::<ImplItemMacro>(tokens)?;
         Ok(parsed.to_token_stream())
     }
-    pub fn trait_item(&self, tokens: TokenStream) -> Result<TokenStream> {
+    pub fn trait_item(&self, context: &Context, tokens: TokenStream) -> Result<TokenStream> {
         let parsed = parse2::<TraitItem>(tokens)?;
 
         let result = match parsed {
-            TraitItem::Const(ref const_) => self.callback(CallbackType::TraitItemConst, const_.to_token_stream()),
-            TraitItem::Method(ref method) => self.callback(CallbackType::TraitItemMethod, method.to_token_stream()),
-            TraitItem::Type(ref type_) => self.callback(CallbackType::TraitItemType, type_.to_token_stream()),
-            TraitItem::Macro(ref macro_) => self.callback(CallbackType::TraitItemMacro, macro_.to_token_stream()),
-            TraitItem::Verbatim(ref verbatim) => self.callback(CallbackType::Verbatim, verbatim.clone()),
+            TraitItem::Const(ref const_) => self.callback(context, CallbackType::TraitItemConst, const_.to_token_stream()),
+            TraitItem::Method(ref method) => self.callback(context, CallbackType::TraitItemMethod, method.to_token_stream()),
+            TraitItem::Type(ref type_) => self.callback(context, CallbackType::TraitItemType, type_.to_token_stream()),
+            TraitItem::Macro(ref macro_) => self.callback(context, CallbackType::TraitItemMacro, macro_.to_token_stream()),
+            TraitItem::Verbatim(ref verbatim) => self.callback(context, CallbackType::Verbatim, verbatim.clone()),
             _ => Ok(parsed.to_token_stream()),
         }?;
         Ok(result)
     }
-    pub fn trait_item_const(&self, tokens: TokenStream) -> Result<TokenStream> {
+    pub fn trait_item_const(&self, context: &Context, tokens: TokenStream) -> Result<TokenStream> {
         let TraitItemConst {
             attrs,
             const_token,
@@ -816,7 +854,7 @@ impl Moisture {
         });
 
         if let Some((eq_token, expr)) = default {
-            let filtered_expr = self.callback(CallbackType::Expr, expr.to_token_stream())?;
+            let filtered_expr = self.callback(context, CallbackType::Expr, expr.to_token_stream())?;
             tokens.push(quote! { #eq_token #filtered_expr });
         }
 
@@ -825,7 +863,7 @@ impl Moisture {
         result.extend(tokens.into_iter());
         Ok(result)
     }
-    pub fn trait_item_method(&self, tokens: TokenStream) -> Result<TokenStream> {
+    pub fn trait_item_method(&self, context: &Context, tokens: TokenStream) -> Result<TokenStream> {
         let TraitItemMethod {
             attrs,
             sig,
@@ -837,7 +875,7 @@ impl Moisture {
         tokens.push(quote! { #(#attrs)* #sig });
 
         if let Some(block) = default {
-            let new_block = self.callback(CallbackType::Block, block.to_token_stream())?;
+            let new_block = self.callback(context, CallbackType::Block, block.to_token_stream())?;
             tokens.push(quote! { #new_block });
         }
 
@@ -848,18 +886,18 @@ impl Moisture {
         result.extend(tokens.into_iter());
         Ok(result)
     }
-    pub fn trait_item_type(&self, tokens: TokenStream) -> Result<TokenStream> {
+    pub fn trait_item_type(&self, _: &Context, tokens: TokenStream) -> Result<TokenStream> {
         let parsed = parse2::<TraitItemType>(tokens)?;
         Ok(parsed.to_token_stream())
     }
-    pub fn trait_item_macro(&self, tokens: TokenStream) -> Result<TokenStream> {
+    pub fn trait_item_macro(&self, _: &Context, tokens: TokenStream) -> Result<TokenStream> {
         let parsed = parse2::<TraitItemMacro>(tokens)?;
         Ok(parsed.to_token_stream())
     }
-    pub fn block(&self, tokens: TokenStream) -> Result<TokenStream> {
+    pub fn block(&self, context: &Context, tokens: TokenStream) -> Result<TokenStream> {
         let parsed = parse2::<Block>(tokens)?;
         let stmts = parsed.stmts.clone();
-        let stmt_tokens = self.callback(CallbackType::Stmts, quote! { #(#stmts)* })?;
+        let stmt_tokens = self.callback(context, CallbackType::Stmts, quote! { #(#stmts)* })?;
 
         Ok(quote! {
             {
@@ -867,31 +905,31 @@ impl Moisture {
             }
         })
     }
-    pub fn stmts(&self, tokens: TokenStream) -> Result<TokenStream> {
+    pub fn stmts(&self, context: &Context, tokens: TokenStream) -> Result<TokenStream> {
         let statements = Block::parse_within.parse2(tokens)?;
         let mut new_statements = Vec::<TokenStream>::new();
 
         for stmt in &statements {
-            let new_stmt = self.callback(CallbackType::Stmt, stmt.to_token_stream())?;
+            let new_stmt = self.callback(context, CallbackType::Stmt, stmt.to_token_stream())?;
             new_statements.push(new_stmt);
         }
 
         Ok(quote! { #(#new_statements)* })
     }
-    pub fn stmt(&self, tokens: TokenStream) -> Result<TokenStream> {
+    pub fn stmt(&self, context: &Context, tokens: TokenStream) -> Result<TokenStream> {
         let parsed = parse2::<Stmt>(tokens)?;
 
         let result = match parsed {
-            Stmt::Local(ref local) => self.callback(CallbackType::Local, local.to_token_stream()),
-            Stmt::Item(ref item) => self.callback(CallbackType::Item, item.to_token_stream()),
-            Stmt::Expr(ref expr) => self.callback(CallbackType::Expr, expr.to_token_stream()),
-            Stmt::Semi(ref expr, _) => self.callback(CallbackType::Expr, expr.to_token_stream()),
+            Stmt::Local(ref local) => self.callback(context, CallbackType::Local, local.to_token_stream()),
+            Stmt::Item(ref item) => self.callback(context, CallbackType::Item, item.to_token_stream()),
+            Stmt::Expr(ref expr) => self.callback(context, CallbackType::Expr, expr.to_token_stream()),
+            Stmt::Semi(ref expr, _) => self.callback(context, CallbackType::Expr, expr.to_token_stream()),
         }?;
 
         if let Stmt::Semi(_, _) = parsed { Ok(quote! { #result ; }) }
         else { Ok(result) }
     }
-    pub fn local(&self, tokens: TokenStream) -> Result<TokenStream> {
+    pub fn local(&self, context: &Context, tokens: TokenStream) -> Result<TokenStream> {
         // Local doesn't implement Parse, so we need to go one level higher to get a Local struct
         let stmt = parse2::<Stmt>(tokens)?;
         let local;
@@ -915,11 +953,21 @@ impl Moisture {
             #let_token
         });
 
-        let new_pat = self.callback(CallbackType::Pat, pat.to_token_stream())?;
+        let new_pat;
+
+        // PatType is a special case that only occurs within local statements, the
+        // Pat parser doesn't interpret this case as a result.
+        if let Pat::Type(pat_type) = pat {
+            new_pat = self.callback(context, CallbackType::PatType, pat_type.to_token_stream())?;
+        }
+        else {
+            new_pat = self.callback(context, CallbackType::Pat, pat.to_token_stream())?;
+        }
+        
         tokens.push(quote! { #new_pat });
 
         if let Some((eq_token, expr)) = init {
-            let new_expr = self.callback(CallbackType::Expr, expr.to_token_stream())?;
+            let new_expr = self.callback(context, CallbackType::Expr, expr.to_token_stream())?;
             tokens.push(quote! { #eq_token #new_expr });
         }
 
@@ -928,31 +976,30 @@ impl Moisture {
         result.extend(tokens.into_iter());
         Ok(result)
     }
-    pub fn pat(&self, tokens: TokenStream) -> Result<TokenStream> {
+    pub fn pat(&self, context: &Context, tokens: TokenStream) -> Result<TokenStream> {
         let parsed = parse2::<Pat>(tokens)?;
 
         let result = match parsed {
-            Pat::Box(ref box_) => self.callback(CallbackType::PatBox, box_.to_token_stream()),
-            Pat::Ident(ref ident) => self.callback(CallbackType::PatIdent, ident.to_token_stream()),
-            Pat::Lit(ref lit) => self.callback(CallbackType::PatLit, lit.to_token_stream()),
-            Pat::Macro(ref macro_) => self.callback(CallbackType::PatMacro, macro_.to_token_stream()),
-            Pat::Or(ref or) => self.callback(CallbackType::PatOr, or.to_token_stream()),
-            Pat::Path(ref path) => self.callback(CallbackType::PatPath, path.to_token_stream()),
-            Pat::Range(ref range) => self.callback(CallbackType::PatRange, range.to_token_stream()),
-            Pat::Reference(ref ref_) => self.callback(CallbackType::PatReference, ref_.to_token_stream()),
-            Pat::Rest(ref rest) => self.callback(CallbackType::PatRest, rest.to_token_stream()),
-            Pat::Slice(ref slice) => self.callback(CallbackType::PatSlice, slice.to_token_stream()),
-            Pat::Struct(ref struct_) => self.callback(CallbackType::PatStruct, struct_.to_token_stream()),
-            Pat::Tuple(ref tuple) => self.callback(CallbackType::PatTuple, tuple.to_token_stream()),
-            Pat::TupleStruct(ref struct_) => self.callback(CallbackType::PatTupleStruct, struct_.to_token_stream()),
-            Pat::Type(ref type_) => self.callback(CallbackType::PatType, type_.to_token_stream()),
-            Pat::Verbatim(ref verbatim) => self.callback(CallbackType::Verbatim, verbatim.clone()),
-            Pat::Wild(ref wild) => self.callback(CallbackType::PatWild, wild.to_token_stream()),
+            Pat::Box(ref box_) => self.callback(context, CallbackType::PatBox, box_.to_token_stream()),
+            Pat::Ident(ref ident) => self.callback(context, CallbackType::PatIdent, ident.to_token_stream()),
+            Pat::Lit(ref lit) => self.callback(context, CallbackType::PatLit, lit.to_token_stream()),
+            Pat::Macro(ref macro_) => self.callback(context, CallbackType::PatMacro, macro_.to_token_stream()),
+            Pat::Or(ref or) => self.callback(context, CallbackType::PatOr, or.to_token_stream()),
+            Pat::Path(ref path) => self.callback(context, CallbackType::PatPath, path.to_token_stream()),
+            Pat::Range(ref range) => self.callback(context, CallbackType::PatRange, range.to_token_stream()),
+            Pat::Reference(ref ref_) => self.callback(context, CallbackType::PatReference, ref_.to_token_stream()),
+            Pat::Rest(ref rest) => self.callback(context, CallbackType::PatRest, rest.to_token_stream()),
+            Pat::Slice(ref slice) => self.callback(context, CallbackType::PatSlice, slice.to_token_stream()),
+            Pat::Struct(ref struct_) => self.callback(context, CallbackType::PatStruct, struct_.to_token_stream()),
+            Pat::Tuple(ref tuple) => self.callback(context, CallbackType::PatTuple, tuple.to_token_stream()),
+            Pat::TupleStruct(ref struct_) => self.callback(context, CallbackType::PatTupleStruct, struct_.to_token_stream()),
+            Pat::Verbatim(ref verbatim) => self.callback(context, CallbackType::Verbatim, verbatim.clone()),
+            Pat::Wild(ref wild) => self.callback(context, CallbackType::PatWild, wild.to_token_stream()),
             _ => Ok(parsed.to_token_stream()),
         }?;
         Ok(result)
     }
-    pub fn pat_box(&self, tokens: TokenStream) -> Result<TokenStream> {
+    pub fn pat_box(&self, _: &Context, tokens: TokenStream) -> Result<TokenStream> {
         let parsed = parse2::<Pat>(tokens)?;
 
         if let Pat::Box(obj) = parsed {
@@ -960,7 +1007,7 @@ impl Moisture {
         }
         else { Err(Error::new(parsed.span(), "expected PatBox object in pattern")) }
     }
-    pub fn pat_ident(&self, tokens: TokenStream) -> Result<TokenStream> {
+    pub fn pat_ident(&self, context: &Context, tokens: TokenStream) -> Result<TokenStream> {
         let parsed = parse2::<Pat>(tokens)?;
         let pat_ident;
 
@@ -991,14 +1038,14 @@ impl Moisture {
         tokens.push(quote! { #ident });
 
         if let Some((at_token, pat)) = subpat {
-            let new_pat = self.callback(CallbackType::Pat, pat.to_token_stream())?;
+            let new_pat = self.callback(context, CallbackType::Pat, pat.to_token_stream())?;
             tokens.push(quote! { #at_token, #new_pat });
         }
 
         result.extend(tokens.into_iter());
         Ok(result)
     }
-    pub fn pat_lit(&self, tokens: TokenStream) -> Result<TokenStream> {
+    pub fn pat_lit(&self, context: &Context, tokens: TokenStream) -> Result<TokenStream> {
         let parsed = parse2::<Pat>(tokens)?;
         let pat_lit;
 
@@ -1008,11 +1055,11 @@ impl Moisture {
         else { return Err(Error::new(parsed.span(), "expected PatLit object in pattern")); }
                
         let PatLit { attrs, expr } = pat_lit;
-        let new_expr = self.callback(CallbackType::Expr, expr.to_token_stream())?;
+        let new_expr = self.callback(context, CallbackType::Expr, expr.to_token_stream())?;
 
         Ok(quote! { #(#attrs)* #new_expr })
     }
-    pub fn pat_macro(&self, tokens: TokenStream) -> Result<TokenStream> {
+    pub fn pat_macro(&self, _: &Context, tokens: TokenStream) -> Result<TokenStream> {
         let parsed = parse2::<Pat>(tokens)?;
 
         if let Pat::Macro(macro_) = parsed {
@@ -1022,7 +1069,7 @@ impl Moisture {
             Err(Error::new(parsed.span(), "expected PatMacro object in pattern"))
         }
     }
-    pub fn pat_or(&self, tokens: TokenStream) -> Result<TokenStream> {
+    pub fn pat_or(&self, context: &Context, tokens: TokenStream) -> Result<TokenStream> {
         let parsed = parse2::<Pat>(tokens)?;
         let pat_or;
 
@@ -1047,7 +1094,7 @@ impl Moisture {
         let mut new_patterns = Vec::<TokenStream>::new();
 
         for case in &cases {
-            let new_pat = self.callback(CallbackType::Pat, case.to_token_stream())?;
+            let new_pat = self.callback(context, CallbackType::Pat, case.to_token_stream())?;
             new_patterns.push(new_pat);
         }
 
@@ -1056,7 +1103,7 @@ impl Moisture {
         result.extend(tokens.into_iter());
         Ok(result)
     }
-    pub fn pat_path(&self, tokens: TokenStream) -> Result<TokenStream> {
+    pub fn pat_path(&self, _: &Context, tokens: TokenStream) -> Result<TokenStream> {
         let parsed = parse2::<Pat>(tokens)?;
 
         if let Pat::Path(path) = parsed {
@@ -1066,7 +1113,7 @@ impl Moisture {
             Err(Error::new(parsed.span(), "expected PatPath object in pattern"))
         }
     }
-    pub fn pat_range(&self, tokens: TokenStream) -> Result<TokenStream> {
+    pub fn pat_range(&self, context: &Context, tokens: TokenStream) -> Result<TokenStream> {
         let parsed = parse2::<Pat>(tokens)?;
         let pat_range;
 
@@ -1081,12 +1128,12 @@ impl Moisture {
             limits,
             hi } = pat_range;
 
-        let new_lo = self.callback(CallbackType::Expr, lo.to_token_stream())?;
-        let new_hi = self.callback(CallbackType::Expr, hi.to_token_stream())?;
+        let new_lo = self.callback(context, CallbackType::Expr, lo.to_token_stream())?;
+        let new_hi = self.callback(context, CallbackType::Expr, hi.to_token_stream())?;
 
         Ok(quote! { #(#attrs)* #new_lo #limits #new_hi })
     }
-    pub fn pat_reference(&self, tokens: TokenStream) -> Result<TokenStream> {
+    pub fn pat_reference(&self, context: &Context, tokens: TokenStream) -> Result<TokenStream> {
         let parsed = parse2::<Pat>(tokens)?;
         let pat_ref;
 
@@ -1109,13 +1156,13 @@ impl Moisture {
             tokens.push(quote! { #mut_token });
         }
 
-        let new_pat = self.callback(CallbackType::Pat, pat.to_token_stream())?;
+        let new_pat = self.callback(context, CallbackType::Pat, pat.to_token_stream())?;
         tokens.push(quote! { #new_pat });
 
         result.extend(tokens.into_iter());
         Ok(result)
     }
-    pub fn pat_rest(&self, tokens: TokenStream) -> Result<TokenStream> {
+    pub fn pat_rest(&self, _: &Context, tokens: TokenStream) -> Result<TokenStream> {
         let parsed = parse2::<Pat>(tokens)?;
 
         if let Pat::Rest(rest) = parsed {
@@ -1123,7 +1170,7 @@ impl Moisture {
         }
         else { Err(Error::new(parsed.span(), "expected PatRest object in pattern")) }
     }
-    pub fn pat_slice(&self, tokens: TokenStream) -> Result<TokenStream> {
+    pub fn pat_slice(&self, context: &Context, tokens: TokenStream) -> Result<TokenStream> {
         let parsed = parse2::<Pat>(tokens)?;
         let pat_slice;
 
@@ -1140,13 +1187,13 @@ impl Moisture {
         let mut new_elems = Vec::<TokenStream>::new();
 
         for elem in &elems {
-            let new_elem = self.callback(CallbackType::Pat, elem.to_token_stream())?;
+            let new_elem = self.callback(context, CallbackType::Pat, elem.to_token_stream())?;
             new_elems.push(new_elem);
         }
 
         Ok(quote! { #(#attrs)* [ #(#new_elems),* ] })
     }
-    pub fn pat_struct(&self, tokens: TokenStream) -> Result<TokenStream> {
+    pub fn pat_struct(&self, context: &Context, tokens: TokenStream) -> Result<TokenStream> {
         let parsed = parse2::<Pat>(tokens)?;
         let pat_struct;
 
@@ -1183,7 +1230,7 @@ impl Moisture {
                 field_tokens.push(quote! { #colon });
             }
 
-            let new_pat = self.callback(CallbackType::Pat, pat.to_token_stream())?;
+            let new_pat = self.callback(context, CallbackType::Pat, pat.to_token_stream())?;
             field_tokens.push(quote! { #new_pat });
 
             field_result.extend(field_tokens.into_iter());
@@ -1200,7 +1247,7 @@ impl Moisture {
         result.extend(tokens.into_iter());
         Ok(result)
     }
-    pub fn pat_tuple(&self, tokens: TokenStream) -> Result<TokenStream> {
+    pub fn pat_tuple(&self, context: &Context, tokens: TokenStream) -> Result<TokenStream> {
         let parsed = parse2::<Pat>(tokens)?;
         let pat_tuple;
 
@@ -1217,13 +1264,13 @@ impl Moisture {
         let mut new_elems = Vec::<TokenStream>::new();
 
         for elem in &elems {
-            let new_elem = self.callback(CallbackType::Pat, elem.to_token_stream())?;
+            let new_elem = self.callback(context, CallbackType::Pat, elem.to_token_stream())?;
             new_elems.push(new_elem);
         }
 
         Ok(quote! { #(#attrs)* ( #(#new_elems),* ) })
     }
-    pub fn pat_tuple_struct(&self, tokens: TokenStream) -> Result<TokenStream> {
+    pub fn pat_tuple_struct(&self, context: &Context, tokens: TokenStream) -> Result<TokenStream> {
         let parsed = parse2::<Pat>(tokens)?;
         let pat_ts;
 
@@ -1237,30 +1284,25 @@ impl Moisture {
             path,
             pat } = pat_ts;
 
-        let new_pat = self.callback(CallbackType::PatTuple, pat.to_token_stream())?;
+        let new_pat = self.callback(context, CallbackType::PatTuple, pat.to_token_stream())?;
 
         Ok(quote! { #(#attrs)* #path #new_pat })
     }
-    pub fn pat_type(&self, tokens: TokenStream) -> Result<TokenStream> {
-        let parsed = parse2::<Pat>(tokens)?;
-        let pat_type;
-
-        if let Pat::Type(ty) = parsed {
-            pat_type = ty;
-        }
-        else { return Err(Error::new(parsed.span(), "expected PatType object in pattern")); }
-        
+    pub fn pat_type(&self, context: &Context, tokens: TokenStream) -> Result<TokenStream> {
+        // the Pat parser doesn't actually interpret this, we need to find a janky way
+        // to reinterpret this pattern cast, which is basically define a stub local
+        // statement, parse that, then get the PatType object out of it.
         let PatType {
             attrs,
             pat,
             colon_token,
-            ty } = pat_type;
+            ty } = get_pat_type(tokens)?;
 
-        let new_pat = self.callback(CallbackType::Pat, pat.to_token_stream())?;
+        let new_pat = self.callback(context, CallbackType::Pat, pat.to_token_stream())?;
 
         Ok(quote! { #(#attrs)* #new_pat #colon_token #ty })
     }
-    pub fn pat_wild(&self, tokens: TokenStream) -> Result<TokenStream> {
+    pub fn pat_wild(&self, _: &Context, tokens: TokenStream) -> Result<TokenStream> {
         let parsed = parse2::<Pat>(tokens)?;
 
         if let Pat::Wild(wild) = parsed {
@@ -1270,55 +1312,55 @@ impl Moisture {
             Err(Error::new(parsed.span(), "expected PatWild object in pattern"))
         }
     }
-    pub fn expr(&self, tokens: TokenStream) -> Result<TokenStream> {
+    pub fn expr(&self, context: &Context, tokens: TokenStream) -> Result<TokenStream> {
         let parsed = parse2::<Expr>(tokens)?;
 
         let result = match parsed {
-            Expr::Array(ref array) => self.callback(CallbackType::ExprArray, array.to_token_stream()),
-            Expr::Assign(ref assign) => self.callback(CallbackType::ExprAssign, assign.to_token_stream()),
-            Expr::AssignOp(ref assign) => self.callback(CallbackType::ExprAssignOp, assign.to_token_stream()),
-            Expr::Async(ref async_) => self.callback(CallbackType::ExprAsync, async_.to_token_stream()),
-            Expr::Await(ref await_) => self.callback(CallbackType::ExprAwait, await_.to_token_stream()),
-            Expr::Binary(ref binary) => self.callback(CallbackType::ExprBinary, binary.to_token_stream()),
-            Expr::Block(ref block) => self.callback(CallbackType::ExprBlock, block.to_token_stream()),
-            Expr::Box(ref box_) => self.callback(CallbackType::ExprBox, box_.to_token_stream()),
-            Expr::Break(ref break_) => self.callback(CallbackType::ExprBreak, break_.to_token_stream()),
-            Expr::Call(ref call) => self.callback(CallbackType::ExprCall, call.to_token_stream()),
-            Expr::Cast(ref cast) => self.callback(CallbackType::ExprCast, cast.to_token_stream()),
-            Expr::Closure(ref closure) => self.callback(CallbackType::ExprClosure, closure.to_token_stream()),
-            Expr::Continue(ref continue_) => self.callback(CallbackType::ExprContinue, continue_.to_token_stream()),
-            Expr::Field(ref field) => self.callback(CallbackType::ExprField, field.to_token_stream()),
-            Expr::ForLoop(ref loop_) => self.callback(CallbackType::ExprForLoop, loop_.to_token_stream()),
-            Expr::Group(ref group) => self.callback(CallbackType::ExprGroup, group.to_token_stream()),
-            Expr::If(ref if_) => self.callback(CallbackType::ExprIf, if_.to_token_stream()),
-            Expr::Index(ref index) => self.callback(CallbackType::ExprIndex, index.to_token_stream()),
-            Expr::Let(ref let_) => self.callback(CallbackType::ExprLet, let_.to_token_stream()),
-            Expr::Lit(ref lit) => self.callback(CallbackType::ExprLit, lit.to_token_stream()),
-            Expr::Loop(ref loop_) => self.callback(CallbackType::ExprLoop, loop_.to_token_stream()),
-            Expr::Macro(ref macro_) => self.callback(CallbackType::ExprMacro, macro_.to_token_stream()),
-            Expr::Match(ref match_) => self.callback(CallbackType::ExprMatch, match_.to_token_stream()),
-            Expr::MethodCall(ref method) => self.callback(CallbackType::ExprMethodCall, method.to_token_stream()),
-            Expr::Paren(ref paren) => self.callback(CallbackType::ExprParen, paren.to_token_stream()),
-            Expr::Path(ref path) => self.callback(CallbackType::ExprPath, path.to_token_stream()),
-            Expr::Range(ref range) => self.callback(CallbackType::ExprRange, range.to_token_stream()),
-            Expr::Reference(ref ref_) => self.callback(CallbackType::ExprReference, ref_.to_token_stream()),
-            Expr::Repeat(ref repeat) => self.callback(CallbackType::ExprRepeat, repeat.to_token_stream()),
-            Expr::Return(ref ret) => self.callback(CallbackType::ExprReturn, ret.to_token_stream()),
-            Expr::Struct(ref struct_) => self.callback(CallbackType::ExprStruct, struct_.to_token_stream()),
-            Expr::Try(ref try_) => self.callback(CallbackType::ExprTry, try_.to_token_stream()),
-            Expr::TryBlock(ref try_) => self.callback(CallbackType::ExprTryBlock, try_.to_token_stream()),
-            Expr::Tuple(ref tuple) => self.callback(CallbackType::ExprTuple, tuple.to_token_stream()),
-            Expr::Type(ref type_) => self.callback(CallbackType::ExprType, type_.to_token_stream()),
-            Expr::Unary(ref unary) => self.callback(CallbackType::ExprUnary, unary.to_token_stream()),
-            Expr::Unsafe(ref unsafe_) => self.callback(CallbackType::ExprUnsafe, unsafe_.to_token_stream()),
-            Expr::Verbatim(ref verbatim) => self.callback(CallbackType::Verbatim, verbatim.clone()),
-            Expr::While(ref while_) => self.callback(CallbackType::ExprWhile, while_.to_token_stream()),
-            Expr::Yield(ref yield_) => self.callback(CallbackType::ExprYield, yield_.to_token_stream()),
+            Expr::Array(ref array) => self.callback(context, CallbackType::ExprArray, array.to_token_stream()),
+            Expr::Assign(ref assign) => self.callback(context, CallbackType::ExprAssign, assign.to_token_stream()),
+            Expr::AssignOp(ref assign) => self.callback(context, CallbackType::ExprAssignOp, assign.to_token_stream()),
+            Expr::Async(ref async_) => self.callback(context, CallbackType::ExprAsync, async_.to_token_stream()),
+            Expr::Await(ref await_) => self.callback(context, CallbackType::ExprAwait, await_.to_token_stream()),
+            Expr::Binary(ref binary) => self.callback(context, CallbackType::ExprBinary, binary.to_token_stream()),
+            Expr::Block(ref block) => self.callback(context, CallbackType::ExprBlock, block.to_token_stream()),
+            Expr::Box(ref box_) => self.callback(context, CallbackType::ExprBox, box_.to_token_stream()),
+            Expr::Break(ref break_) => self.callback(context, CallbackType::ExprBreak, break_.to_token_stream()),
+            Expr::Call(ref call) => self.callback(context, CallbackType::ExprCall, call.to_token_stream()),
+            Expr::Cast(ref cast) => self.callback(context, CallbackType::ExprCast, cast.to_token_stream()),
+            Expr::Closure(ref closure) => self.callback(context, CallbackType::ExprClosure, closure.to_token_stream()),
+            Expr::Continue(ref continue_) => self.callback(context, CallbackType::ExprContinue, continue_.to_token_stream()),
+            Expr::Field(ref field) => self.callback(context, CallbackType::ExprField, field.to_token_stream()),
+            Expr::ForLoop(ref loop_) => self.callback(context, CallbackType::ExprForLoop, loop_.to_token_stream()),
+            Expr::Group(ref group) => self.callback(context, CallbackType::ExprGroup, group.to_token_stream()),
+            Expr::If(ref if_) => self.callback(context, CallbackType::ExprIf, if_.to_token_stream()),
+            Expr::Index(ref index) => self.callback(context, CallbackType::ExprIndex, index.to_token_stream()),
+            Expr::Let(ref let_) => self.callback(context, CallbackType::ExprLet, let_.to_token_stream()),
+            Expr::Lit(ref lit) => self.callback(context, CallbackType::ExprLit, lit.to_token_stream()),
+            Expr::Loop(ref loop_) => self.callback(context, CallbackType::ExprLoop, loop_.to_token_stream()),
+            Expr::Macro(ref macro_) => self.callback(context, CallbackType::ExprMacro, macro_.to_token_stream()),
+            Expr::Match(ref match_) => self.callback(context, CallbackType::ExprMatch, match_.to_token_stream()),
+            Expr::MethodCall(ref method) => self.callback(context, CallbackType::ExprMethodCall, method.to_token_stream()),
+            Expr::Paren(ref paren) => self.callback(context, CallbackType::ExprParen, paren.to_token_stream()),
+            Expr::Path(ref path) => self.callback(context, CallbackType::ExprPath, path.to_token_stream()),
+            Expr::Range(ref range) => self.callback(context, CallbackType::ExprRange, range.to_token_stream()),
+            Expr::Reference(ref ref_) => self.callback(context, CallbackType::ExprReference, ref_.to_token_stream()),
+            Expr::Repeat(ref repeat) => self.callback(context, CallbackType::ExprRepeat, repeat.to_token_stream()),
+            Expr::Return(ref ret) => self.callback(context, CallbackType::ExprReturn, ret.to_token_stream()),
+            Expr::Struct(ref struct_) => self.callback(context, CallbackType::ExprStruct, struct_.to_token_stream()),
+            Expr::Try(ref try_) => self.callback(context, CallbackType::ExprTry, try_.to_token_stream()),
+            Expr::TryBlock(ref try_) => self.callback(context, CallbackType::ExprTryBlock, try_.to_token_stream()),
+            Expr::Tuple(ref tuple) => self.callback(context, CallbackType::ExprTuple, tuple.to_token_stream()),
+            Expr::Type(ref type_) => self.callback(context, CallbackType::ExprType, type_.to_token_stream()),
+            Expr::Unary(ref unary) => self.callback(context, CallbackType::ExprUnary, unary.to_token_stream()),
+            Expr::Unsafe(ref unsafe_) => self.callback(context, CallbackType::ExprUnsafe, unsafe_.to_token_stream()),
+            Expr::Verbatim(ref verbatim) => self.callback(context, CallbackType::Verbatim, verbatim.clone()),
+            Expr::While(ref while_) => self.callback(context, CallbackType::ExprWhile, while_.to_token_stream()),
+            Expr::Yield(ref yield_) => self.callback(context, CallbackType::ExprYield, yield_.to_token_stream()),
             _ => Ok(parsed.to_token_stream()),
         }?;
         Ok(result)
     }
-    pub fn expr_array(&self, tokens: TokenStream) -> Result<TokenStream> {
+    pub fn expr_array(&self, context: &Context, tokens: TokenStream) -> Result<TokenStream> {
         let ExprArray {
             attrs,
             bracket_token: _,
@@ -1327,13 +1369,13 @@ impl Moisture {
         let mut new_elems = Vec::<TokenStream>::new();
 
         for elem in &elems {
-            let new_elem = self.callback(CallbackType::Expr, elem.to_token_stream())?;
+            let new_elem = self.callback(context, CallbackType::Expr, elem.to_token_stream())?;
             new_elems.push(new_elem);
         }
 
         Ok(quote! { #(#attrs)* [ #(#new_elems),* ] })
     }
-    pub fn expr_assign(&self, tokens: TokenStream) -> Result<TokenStream> {
+    pub fn expr_assign(&self, context: &Context, tokens: TokenStream) -> Result<TokenStream> {
         let ExprAssign {
             attrs,
             left,
@@ -1344,18 +1386,18 @@ impl Moisture {
 
         tokens.push(quote! { #(#attrs)* });
 
-        let new_left = self.callback(CallbackType::Expr, left.to_token_stream())?;
+        let new_left = self.callback(context, CallbackType::Expr, left.to_token_stream())?;
         tokens.push(new_left);
 
         tokens.push(quote! { #eq_token });
 
-        let new_right = self.callback(CallbackType::Expr, right.to_token_stream())?;
+        let new_right = self.callback(context, CallbackType::Expr, right.to_token_stream())?;
         tokens.push(new_right);
 
         result.extend(tokens.into_iter());
         Ok(result)
     }
-    pub fn expr_assign_op(&self, tokens: TokenStream) -> Result<TokenStream> {
+    pub fn expr_assign_op(&self, context: &Context, tokens: TokenStream) -> Result<TokenStream> {
         let ExprAssignOp {
             attrs,
             left,
@@ -1366,17 +1408,17 @@ impl Moisture {
 
         tokens.push(quote! { #(#attrs)* });
 
-        let new_left = self.callback(CallbackType::Expr, left.to_token_stream())?;
+        let new_left = self.callback(context, CallbackType::Expr, left.to_token_stream())?;
         tokens.push(new_left);
         tokens.push(quote! { #op });
 
-        let new_right = self.callback(CallbackType::Expr, right.to_token_stream())?;
+        let new_right = self.callback(context, CallbackType::Expr, right.to_token_stream())?;
         tokens.push(new_right);
 
         result.extend(tokens.into_iter());
         Ok(result)
     }
-    pub fn expr_async(&self, tokens: TokenStream) -> Result<TokenStream> {
+    pub fn expr_async(&self, context: &Context, tokens: TokenStream) -> Result<TokenStream> {
         let ExprAsync {
             attrs,
             async_token,
@@ -1391,13 +1433,13 @@ impl Moisture {
             tokens.push(quote! { #move_token });
         }
 
-        let new_block = self.callback(CallbackType::Block, block.to_token_stream())?;
+        let new_block = self.callback(context, CallbackType::Block, block.to_token_stream())?;
         tokens.push(new_block);
 
         result.extend(tokens.into_iter());
         Ok(result)
     }
-    pub fn expr_await(&self, tokens: TokenStream) -> Result<TokenStream> {
+    pub fn expr_await(&self, context: &Context, tokens: TokenStream) -> Result<TokenStream> {
         let ExprAwait {
             attrs,
             base,
@@ -1408,13 +1450,13 @@ impl Moisture {
 
         tokens.push(quote! { #(#attrs)* });
 
-        let new_expr = self.callback(CallbackType::Expr, base.to_token_stream())?;
+        let new_expr = self.callback(context, CallbackType::Expr, base.to_token_stream())?;
         tokens.push(quote! { #new_expr #dot_token #await_token });
 
         result.extend(tokens.into_iter());
         Ok(result)
     }
-    pub fn expr_binary(&self, tokens: TokenStream) -> Result<TokenStream> {
+    pub fn expr_binary(&self, context: &Context, tokens: TokenStream) -> Result<TokenStream> {
         let ExprBinary {
             attrs,
             left,
@@ -1425,17 +1467,17 @@ impl Moisture {
 
         tokens.push(quote! { #(#attrs)* });
         
-        let new_left = self.callback(CallbackType::Expr, left.to_token_stream())?;
+        let new_left = self.callback(context, CallbackType::Expr, left.to_token_stream())?;
         tokens.push(new_left);
         tokens.push(quote! { #op });
 
-        let new_right = self.callback(CallbackType::Expr, right.to_token_stream())?;
+        let new_right = self.callback(context, CallbackType::Expr, right.to_token_stream())?;
         tokens.push(new_right);
 
         result.extend(tokens.into_iter());
         Ok(result)
     }
-    pub fn expr_block(&self, tokens: TokenStream) -> Result<TokenStream> {
+    pub fn expr_block(&self, context: &Context, tokens: TokenStream) -> Result<TokenStream> {
         let ExprBlock {
             attrs,
             label,
@@ -1449,23 +1491,23 @@ impl Moisture {
             tokens.push(quote! { #label_token });
         }
 
-        let new_block = self.callback(CallbackType::Block, block.to_token_stream())?;
+        let new_block = self.callback(context, CallbackType::Block, block.to_token_stream())?;
         tokens.push(new_block);
 
         result.extend(tokens.into_iter());
         Ok(result)
     }
-    pub fn expr_box(&self, tokens: TokenStream) -> Result<TokenStream> {
+    pub fn expr_box(&self, context: &Context, tokens: TokenStream) -> Result<TokenStream> {
         let ExprBox {
             attrs,
             box_token,
             expr } = parse2::<ExprBox>(tokens)?;
 
-        let new_expr = self.callback(CallbackType::Expr, expr.to_token_stream())?;
+        let new_expr = self.callback(context, CallbackType::Expr, expr.to_token_stream())?;
 
         Ok(quote! { #(#attrs)* #box_token #new_expr })
     }
-    pub fn expr_break(&self, tokens: TokenStream) -> Result<TokenStream> {
+    pub fn expr_break(&self, context: &Context, tokens: TokenStream) -> Result<TokenStream> {
         let ExprBreak {
             attrs,
             break_token,
@@ -1481,42 +1523,42 @@ impl Moisture {
         }
 
         if let Some(expr_opt) = expr {
-            let new_expr = self.callback(CallbackType::Expr, expr_opt.to_token_stream())?;
+            let new_expr = self.callback(context, CallbackType::Expr, expr_opt.to_token_stream())?;
             tokens.push(new_expr);
         }
 
         result.extend(tokens.into_iter());
         Ok(result)
     }
-    pub fn expr_call(&self, tokens: TokenStream) -> Result<TokenStream> {
+    pub fn expr_call(&self, context: &Context, tokens: TokenStream) -> Result<TokenStream> {
         let ExprCall {
             attrs,
             func,
             paren_token: _,
             args } = parse2::<ExprCall>(tokens)?;
 
-        let new_func = self.callback(CallbackType::Expr, func.to_token_stream())?;
+        let new_func = self.callback(context, CallbackType::Expr, func.to_token_stream())?;
         let mut new_args = Vec::<TokenStream>::new();
 
         for arg in &args {
-            let new_arg = self.callback(CallbackType::Expr, arg.to_token_stream())?;
+            let new_arg = self.callback(context, CallbackType::Expr, arg.to_token_stream())?;
             new_args.push(new_arg);
         }
 
         Ok(quote! { #(#attrs)* #new_func ( #(#new_args),* ) })
     }
-    pub fn expr_cast(&self, tokens: TokenStream) -> Result<TokenStream> {
+    pub fn expr_cast(&self, context: &Context, tokens: TokenStream) -> Result<TokenStream> {
         let ExprCast {
             attrs,
             expr,
             as_token,
             ty } = parse2::<ExprCast>(tokens)?;
 
-        let new_expr = self.callback(CallbackType::Expr, expr.to_token_stream())?;
+        let new_expr = self.callback(context, CallbackType::Expr, expr.to_token_stream())?;
 
         Ok(quote! { #(#attrs)* #new_expr #as_token #ty })
     }
-    pub fn expr_closure(&self, tokens: TokenStream) -> Result<TokenStream> {
+    pub fn expr_closure(&self, context: &Context, tokens: TokenStream) -> Result<TokenStream> {
         let ExprClosure {
             attrs,
             movability,
@@ -1547,34 +1589,34 @@ impl Moisture {
         let mut new_inputs = Vec::<TokenStream>::new();
 
         for input in &inputs {
-            let new_input = self.callback(CallbackType::Pat, input.to_token_stream())?;
+            let new_input = self.callback(context, CallbackType::Pat, input.to_token_stream())?;
             new_inputs.push(new_input);
         }
 
         tokens.push(quote! { #or1_token #(#new_inputs),* #or2_token #output });
 
-        let new_expr = self.callback(CallbackType::Expr, body.to_token_stream())?;
+        let new_expr = self.callback(context, CallbackType::Expr, body.to_token_stream())?;
         tokens.push(new_expr);
 
         result.extend(tokens.into_iter());
         Ok(result)
     }
-    pub fn expr_continue(&self, tokens: TokenStream) -> Result<TokenStream> {
+    pub fn expr_continue(&self, _: &Context, tokens: TokenStream) -> Result<TokenStream> {
         let parsed = parse2::<ExprContinue>(tokens)?;
         Ok(parsed.to_token_stream())
     }
-    pub fn expr_field(&self, tokens: TokenStream) -> Result<TokenStream> {
+    pub fn expr_field(&self, context: &Context, tokens: TokenStream) -> Result<TokenStream> {
         let ExprField {
             attrs,
             base,
             dot_token,
             member } = parse2::<ExprField>(tokens)?;
 
-        let new_base = self.callback(CallbackType::Expr, base.to_token_stream())?;
+        let new_base = self.callback(context, CallbackType::Expr, base.to_token_stream())?;
 
         Ok(quote! { #(#attrs)* #new_base #dot_token #member })
     }
-    pub fn expr_for_loop(&self, tokens: TokenStream) -> Result<TokenStream> {
+    pub fn expr_for_loop(&self, context: &Context, tokens: TokenStream) -> Result<TokenStream> {
         let ExprForLoop {
             attrs,
             label,
@@ -1592,19 +1634,19 @@ impl Moisture {
             tokens.push(quote! { #label_token });
         }
 
-        let new_pat = self.callback(CallbackType::Pat, pat.to_token_stream())?;
+        let new_pat = self.callback(context, CallbackType::Pat, pat.to_token_stream())?;
         tokens.push(quote! { #for_token #new_pat #in_token });
 
-        let new_expr = self.callback(CallbackType::Expr, expr.to_token_stream())?;
+        let new_expr = self.callback(context, CallbackType::Expr, expr.to_token_stream())?;
         tokens.push(new_expr);
 
-        let new_block = self.callback(CallbackType::Block, body.to_token_stream())?;
+        let new_block = self.callback(context, CallbackType::Block, body.to_token_stream())?;
         tokens.push(new_block);
 
         result.extend(tokens.into_iter());
         Ok(result)
     }
-    pub fn expr_group(&self, tokens: TokenStream) -> Result<TokenStream> {
+    pub fn expr_group(&self, context: &Context, tokens: TokenStream) -> Result<TokenStream> {
         let parsed = parse2::<Expr>(tokens)?;
         let expr_group;
 
@@ -1618,11 +1660,11 @@ impl Moisture {
             group_token: _,
             expr } = expr_group;
 
-        let new_expr = self.callback(CallbackType::Expr, expr.to_token_stream())?;
+        let new_expr = self.callback(context, CallbackType::Expr, expr.to_token_stream())?;
 
         Ok(quote! { #(#attrs)* #new_expr })
     }
-    pub fn expr_if(&self, tokens: TokenStream) -> Result<TokenStream> {
+    pub fn expr_if(&self, context: &Context, tokens: TokenStream) -> Result<TokenStream> {
         let ExprIf {
             attrs,
             if_token,
@@ -1634,33 +1676,33 @@ impl Moisture {
 
         tokens.push(quote! { #(#attrs)* #if_token });
 
-        let new_expr = self.callback(CallbackType::Expr, cond.to_token_stream())?;
+        let new_expr = self.callback(context, CallbackType::Expr, cond.to_token_stream())?;
         tokens.push(new_expr);
 
-        let new_block = self.callback(CallbackType::Block, then_branch.to_token_stream())?;
+        let new_block = self.callback(context, CallbackType::Block, then_branch.to_token_stream())?;
         tokens.push(new_block);
 
         if let Some((else_token, else_expr)) = else_branch {
-            let new_expr = self.callback(CallbackType::Expr, else_expr.to_token_stream())?;
+            let new_expr = self.callback(context, CallbackType::Expr, else_expr.to_token_stream())?;
             tokens.push(quote! { #else_token #new_expr });
         }
 
         result.extend(tokens.into_iter());
         Ok(result)
     }
-    pub fn expr_index(&self, tokens: TokenStream) -> Result<TokenStream> {
+    pub fn expr_index(&self, context: &Context, tokens: TokenStream) -> Result<TokenStream> {
         let ExprIndex {
             attrs,
             expr,
             bracket_token: _,
             index } = parse2::<ExprIndex>(tokens)?;
 
-        let new_expr = self.callback(CallbackType::Expr, expr.to_token_stream())?;
-        let new_index = self.callback(CallbackType::Expr, index.to_token_stream())?;
+        let new_expr = self.callback(context, CallbackType::Expr, expr.to_token_stream())?;
+        let new_index = self.callback(context, CallbackType::Expr, index.to_token_stream())?;
 
         Ok(quote! { #(#attrs)* #new_expr [ #new_index ] })
     }
-    pub fn expr_let(&self, tokens: TokenStream) -> Result<TokenStream> {
+    pub fn expr_let(&self, context: &Context, tokens: TokenStream) -> Result<TokenStream> {
         let ExprLet {
             attrs,
             let_token,
@@ -1668,21 +1710,21 @@ impl Moisture {
             eq_token,
             expr } = parse2::<ExprLet>(tokens)?;
 
-        let new_pat = self.callback(CallbackType::Pat, pat.to_token_stream())?;
-        let new_expr = self.callback(CallbackType::Expr, expr.to_token_stream())?;
+        let new_pat = self.callback(context, CallbackType::Pat, pat.to_token_stream())?;
+        let new_expr = self.callback(context, CallbackType::Expr, expr.to_token_stream())?;
 
         Ok(quote! { #(#attrs)* #let_token #new_pat #eq_token #new_expr })
     }
-    pub fn expr_lit(&self, tokens: TokenStream) -> Result<TokenStream> {
+    pub fn expr_lit(&self, context: &Context, tokens: TokenStream) -> Result<TokenStream> {
         let ExprLit {
             attrs,
             lit } = parse2::<ExprLit>(tokens)?;
 
-        let new_lit = self.callback(CallbackType::Lit, lit.to_token_stream())?;
+        let new_lit = self.callback(context, CallbackType::Lit, lit.to_token_stream())?;
 
         Ok(quote! { #(#attrs)* #new_lit })
     }
-    pub fn expr_loop(&self, tokens: TokenStream) -> Result<TokenStream> {
+    pub fn expr_loop(&self, context: &Context, tokens: TokenStream) -> Result<TokenStream> {
         let ExprLoop {
             attrs,
             label,
@@ -1699,17 +1741,17 @@ impl Moisture {
 
         tokens.push(quote! { #loop_token });
         
-        let new_block = self.callback(CallbackType::Block, body.to_token_stream())?;
+        let new_block = self.callback(context, CallbackType::Block, body.to_token_stream())?;
         tokens.push(new_block);
 
         result.extend(tokens.into_iter());
         Ok(result)
     }
-    pub fn expr_macro(&self, tokens: TokenStream) -> Result<TokenStream> {
+    pub fn expr_macro(&self, _: &Context, tokens: TokenStream) -> Result<TokenStream> {
         let parsed = parse2::<ExprMacro>(tokens)?;
         Ok(parsed.to_token_stream())
     }
-    pub fn expr_match(&self, tokens: TokenStream) -> Result<TokenStream> {
+    pub fn expr_match(&self, context: &Context, tokens: TokenStream) -> Result<TokenStream> {
         let ExprMatch {
             attrs,
             match_token,
@@ -1721,13 +1763,13 @@ impl Moisture {
 
         tokens.push(quote! { #(#attrs)* #match_token });
 
-        let new_expr = self.callback(CallbackType::Expr, expr.to_token_stream())?;
+        let new_expr = self.callback(context, CallbackType::Expr, expr.to_token_stream())?;
         tokens.push(new_expr);
 
         let mut new_arms = Vec::<TokenStream>::new();
 
         for arm in &arms {
-            let new_arm = self.callback(CallbackType::Arm, arm.to_token_stream())?;
+            let new_arm = self.callback(context, CallbackType::Arm, arm.to_token_stream())?;
             new_arms.push(new_arm);
         }
 
@@ -1740,7 +1782,7 @@ impl Moisture {
         result.extend(tokens.into_iter());
         Ok(result)
     }
-    pub fn expr_method_call(&self, tokens: TokenStream) -> Result<TokenStream> {
+    pub fn expr_method_call(&self, context: &Context, tokens: TokenStream) -> Result<TokenStream> {
         let ExprMethodCall {
             attrs,
             receiver,
@@ -1754,7 +1796,7 @@ impl Moisture {
 
         tokens.push(quote! { #(#attrs)* });
 
-        let new_receiver = self.callback(CallbackType::Expr, receiver.to_token_stream())?;
+        let new_receiver = self.callback(context, CallbackType::Expr, receiver.to_token_stream())?;
         tokens.push(new_receiver);
 
         tokens.push(quote! { #dot_token #method });
@@ -1766,7 +1808,7 @@ impl Moisture {
         let mut new_args = Vec::<TokenStream>::new();
 
         for arg in &args {
-            let new_arg = self.callback(CallbackType::Expr, arg.to_token_stream())?;
+            let new_arg = self.callback(context, CallbackType::Expr, arg.to_token_stream())?;
             new_args.push(new_arg);
         }
 
@@ -1775,21 +1817,21 @@ impl Moisture {
         result.extend(tokens.into_iter());
         Ok(result)
     }
-    pub fn expr_paren(&self, tokens: TokenStream) -> Result<TokenStream> {
+    pub fn expr_paren(&self, context: &Context, tokens: TokenStream) -> Result<TokenStream> {
         let ExprParen {
             attrs,
             paren_token: _,
             expr } = parse2::<ExprParen>(tokens)?;
 
-        let new_expr = self.callback(CallbackType::Expr, expr.to_token_stream())?;
+        let new_expr = self.callback(context, CallbackType::Expr, expr.to_token_stream())?;
 
         Ok(quote! { #(#attrs)* ( #new_expr ) })
     }
-    pub fn expr_path(&self, tokens: TokenStream) -> Result<TokenStream> {
+    pub fn expr_path(&self, _: &Context, tokens: TokenStream) -> Result<TokenStream> {
         let parsed = parse2::<ExprPath>(tokens)?;
         Ok(parsed.to_token_stream())
     }
-    pub fn expr_range(&self, tokens: TokenStream) -> Result<TokenStream> {
+    pub fn expr_range(&self, context: &Context, tokens: TokenStream) -> Result<TokenStream> {
         let ExprRange {
             attrs,
             from,
@@ -1801,21 +1843,21 @@ impl Moisture {
         tokens.push(quote! { #(#attrs)* });
 
         if let Some(from_expr) = from {
-            let new_expr = self.callback(CallbackType::Expr, from_expr.to_token_stream())?;
+            let new_expr = self.callback(context, CallbackType::Expr, from_expr.to_token_stream())?;
             tokens.push(new_expr);
         }
 
         tokens.push(quote! { #limits });
 
         if let Some(to_expr) = to {
-            let new_expr = self.callback(CallbackType::Expr, to_expr.to_token_stream())?;
+            let new_expr = self.callback(context, CallbackType::Expr, to_expr.to_token_stream())?;
             tokens.push(new_expr);
         }
 
         result.extend(tokens.into_iter());
         Ok(result)
     }
-    pub fn expr_reference(&self, tokens: TokenStream) -> Result<TokenStream> {
+    pub fn expr_reference(&self, context: &Context, tokens: TokenStream) -> Result<TokenStream> {
         let ExprReference {
             attrs,
             and_token,
@@ -1831,13 +1873,13 @@ impl Moisture {
             tokens.push(quote! { #mut_token });
         }
 
-        let new_expr = self.callback(CallbackType::Expr, expr.to_token_stream())?;
+        let new_expr = self.callback(context, CallbackType::Expr, expr.to_token_stream())?;
         tokens.push(new_expr);
 
         result.extend(tokens.into_iter());
         Ok(result)
     }
-    pub fn expr_repeat(&self, tokens: TokenStream) -> Result<TokenStream> {
+    pub fn expr_repeat(&self, context: &Context, tokens: TokenStream) -> Result<TokenStream> {
         let ExprRepeat {
             attrs,
             bracket_token: _,
@@ -1845,19 +1887,19 @@ impl Moisture {
             semi_token,
             len } = parse2::<ExprRepeat>(tokens)?;
 
-        let new_expr = self.callback(CallbackType::Expr, expr.to_token_stream())?;
-        let new_len = self.callback(CallbackType::Expr, len.to_token_stream())?;
+        let new_expr = self.callback(context, CallbackType::Expr, expr.to_token_stream())?;
+        let new_len = self.callback(context, CallbackType::Expr, len.to_token_stream())?;
 
         Ok(quote! { #(#attrs)* [ #new_expr #semi_token #new_len ] })
     }
-    pub fn expr_return(&self, tokens: TokenStream) -> Result<TokenStream> {
+    pub fn expr_return(&self, context: &Context, tokens: TokenStream) -> Result<TokenStream> {
         let ExprReturn {
             attrs,
             return_token,
             expr } = parse2::<ExprReturn>(tokens)?;
 
         if let Some(ret_expr) = expr {
-            let new_expr = self.callback(CallbackType::Expr, ret_expr.to_token_stream())?;
+            let new_expr = self.callback(context, CallbackType::Expr, ret_expr.to_token_stream())?;
      
             Ok(quote! { #(#attrs)* #return_token #new_expr })
         }
@@ -1865,7 +1907,7 @@ impl Moisture {
             Ok(quote! { #(#attrs)* #return_token })
         }
     }
-    pub fn expr_struct(&self, tokens: TokenStream) -> Result<TokenStream> {
+    pub fn expr_struct(&self, context: &Context, tokens: TokenStream) -> Result<TokenStream> {
         let ExprStruct {
             attrs,
             path,
@@ -1881,7 +1923,7 @@ impl Moisture {
         let mut new_fields = Vec::<TokenStream>::new();
 
         for field in &fields {
-            let new_field = self.callback(CallbackType::FieldValue, field.to_token_stream())?;
+            let new_field = self.callback(context, CallbackType::FieldValue, field.to_token_stream())?;
             new_fields.push(new_field);
         }
 
@@ -1901,27 +1943,27 @@ impl Moisture {
         result.extend(tokens.into_iter());
         Ok(result)
     }
-    pub fn expr_try(&self, tokens: TokenStream) -> Result<TokenStream> {
+    pub fn expr_try(&self, context: &Context, tokens: TokenStream) -> Result<TokenStream> {
         let ExprTry {
             attrs,
             expr,
             question_token } = parse2::<ExprTry>(tokens)?;
 
-        let new_expr = self.callback(CallbackType::Expr, expr.to_token_stream())?;
+        let new_expr = self.callback(context, CallbackType::Expr, expr.to_token_stream())?;
 
         Ok(quote! { #(#attrs)* #new_expr #question_token })
     }
-    pub fn expr_try_block(&self, tokens: TokenStream) -> Result<TokenStream> {
+    pub fn expr_try_block(&self, context: &Context, tokens: TokenStream) -> Result<TokenStream> {
         let ExprTryBlock {
             attrs,
             try_token,
             block } = parse2::<ExprTryBlock>(tokens)?;
 
-        let new_block = self.callback(CallbackType::Block, block.to_token_stream())?;
+        let new_block = self.callback(context, CallbackType::Block, block.to_token_stream())?;
 
         Ok(quote! { #(#attrs)* #try_token #new_block })
     }
-    pub fn expr_tuple(&self, tokens: TokenStream) -> Result<TokenStream> {
+    pub fn expr_tuple(&self, context: &Context, tokens: TokenStream) -> Result<TokenStream> {
         let ExprTuple {
             attrs,
             paren_token: _,
@@ -1930,44 +1972,44 @@ impl Moisture {
         let mut new_elems = Vec::<TokenStream>::new();
 
         for elem in &elems {
-            let new_elem = self.callback(CallbackType::Expr, elem.to_token_stream())?;
+            let new_elem = self.callback(context, CallbackType::Expr, elem.to_token_stream())?;
             new_elems.push(new_elem);
         }
 
         Ok(quote! { #(#attrs)* ( #(#new_elems),* ) })
     }
-    pub fn expr_type(&self, tokens: TokenStream) -> Result<TokenStream> {
+    pub fn expr_type(&self, context: &Context, tokens: TokenStream) -> Result<TokenStream> {
         let ExprType {
             attrs,
             expr,
             colon_token,
             ty } = parse2::<ExprType>(tokens)?;
 
-        let new_expr = self.callback(CallbackType::Expr, expr.to_token_stream())?;
+        let new_expr = self.callback(context, CallbackType::Expr, expr.to_token_stream())?;
 
         Ok(quote! { #(#attrs)* #new_expr #colon_token #ty })
     }
-    pub fn expr_unary(&self, tokens: TokenStream) -> Result<TokenStream> {
+    pub fn expr_unary(&self, context: &Context, tokens: TokenStream) -> Result<TokenStream> {
         let ExprUnary {
             attrs,
             op,
             expr } = parse2::<ExprUnary>(tokens)?;
 
-        let new_expr = self.callback(CallbackType::Expr, expr.to_token_stream())?;
+        let new_expr = self.callback(context, CallbackType::Expr, expr.to_token_stream())?;
 
         Ok(quote! { #(#attrs)* #op #new_expr })
     }
-    pub fn expr_unsafe(&self, tokens: TokenStream) -> Result<TokenStream> {
+    pub fn expr_unsafe(&self, context: &Context, tokens: TokenStream) -> Result<TokenStream> {
         let ExprUnsafe {
             attrs,
             unsafe_token,
             block } = parse2::<ExprUnsafe>(tokens)?;
 
-        let new_block = self.callback(CallbackType::Block, block.to_token_stream())?;
+        let new_block = self.callback(context, CallbackType::Block, block.to_token_stream())?;
 
         Ok(quote! { #(#attrs)* #unsafe_token #new_block })
     }
-    pub fn expr_while(&self, tokens: TokenStream) -> Result<TokenStream> {
+    pub fn expr_while(&self, context: &Context, tokens: TokenStream) -> Result<TokenStream> {
         let ExprWhile {
             attrs,
             label,
@@ -1975,8 +2017,8 @@ impl Moisture {
             cond,
             body } = parse2::<ExprWhile>(tokens)?;
 
-        let new_cond = self.callback(CallbackType::Expr, cond.to_token_stream())?;
-        let new_body = self.callback(CallbackType::Block, body.to_token_stream())?;
+        let new_cond = self.callback(context, CallbackType::Expr, cond.to_token_stream())?;
+        let new_body = self.callback(context, CallbackType::Block, body.to_token_stream())?;
 
         if let Some(lbl) = label {
             Ok(quote! { #(#attrs)* #lbl #while_token #new_cond #new_body })
@@ -1985,14 +2027,14 @@ impl Moisture {
             Ok(quote! { #(#attrs)* #while_token #new_cond #new_body })
         }
     }
-    pub fn expr_yield(&self, tokens: TokenStream) -> Result<TokenStream> {
+    pub fn expr_yield(&self, context: &Context, tokens: TokenStream) -> Result<TokenStream> {
         let ExprYield {
             attrs,
             yield_token,
             expr } = parse2::<ExprYield>(tokens)?;
 
         if let Some(yield_expr) = expr {
-            let new_expr = self.callback(CallbackType::Expr, yield_expr.to_token_stream())?;
+            let new_expr = self.callback(context, CallbackType::Expr, yield_expr.to_token_stream())?;
 
             Ok(quote! { #(#attrs)* #yield_token #new_expr })
         }
@@ -2000,7 +2042,7 @@ impl Moisture {
             Ok(quote! { #(#attrs)* #yield_token })
         }
     }
-    pub fn arm(&self, tokens: TokenStream) -> Result<TokenStream> {
+    pub fn arm(&self, context: &Context, tokens: TokenStream) -> Result<TokenStream> {
         let Arm {
             attrs,
             pat,
@@ -2013,17 +2055,17 @@ impl Moisture {
 
         tokens.push(quote! { #(#attrs)* });
 
-        let new_pat = self.callback(CallbackType::Pat, pat.to_token_stream())?;
+        let new_pat = self.callback(context, CallbackType::Pat, pat.to_token_stream())?;
         tokens.push(new_pat);
 
         if let Some((if_token, if_expr)) = guard {
-            let new_expr = self.callback(CallbackType::Expr, if_expr.to_token_stream())?;
+            let new_expr = self.callback(context, CallbackType::Expr, if_expr.to_token_stream())?;
             tokens.push(quote! { #if_token #new_expr });
         }
 
         tokens.push(quote! { #fat_arrow_token });
 
-        let new_expr = self.callback(CallbackType::Expr, body.to_token_stream())?;
+        let new_expr = self.callback(context, CallbackType::Expr, body.to_token_stream())?;
         tokens.push(new_expr);
 
         if let Some(comma_token) = comma {
@@ -2033,57 +2075,57 @@ impl Moisture {
         result.extend(tokens.into_iter());
         Ok(result)
     }
-    pub fn lit(&self, tokens: TokenStream) -> Result<TokenStream> {
+    pub fn lit(&self, context: &Context, tokens: TokenStream) -> Result<TokenStream> {
         let parsed = parse2::<Lit>(tokens)?;
 
         let result = match parsed {
-            Lit::Str(ref str_) => self.callback(CallbackType::LitStr, str_.to_token_stream()),
-            Lit::ByteStr(ref str_) => self.callback(CallbackType::LitByteStr, str_.to_token_stream()),
-            Lit::Byte(ref byte) => self.callback(CallbackType::LitByte, byte.to_token_stream()),
-            Lit::Char(ref char_) => self.callback(CallbackType::LitChar, char_.to_token_stream()),
-            Lit::Int(ref int) => self.callback(CallbackType::LitInt, int.to_token_stream()),
-            Lit::Float(ref float) => self.callback(CallbackType::LitFloat, float.to_token_stream()),
-            Lit::Bool(ref bool_) => self.callback(CallbackType::LitBool, bool_.to_token_stream()),
+            Lit::Str(ref str_) => self.callback(context, CallbackType::LitStr, str_.to_token_stream()),
+            Lit::ByteStr(ref str_) => self.callback(context, CallbackType::LitByteStr, str_.to_token_stream()),
+            Lit::Byte(ref byte) => self.callback(context, CallbackType::LitByte, byte.to_token_stream()),
+            Lit::Char(ref char_) => self.callback(context, CallbackType::LitChar, char_.to_token_stream()),
+            Lit::Int(ref int) => self.callback(context, CallbackType::LitInt, int.to_token_stream()),
+            Lit::Float(ref float) => self.callback(context, CallbackType::LitFloat, float.to_token_stream()),
+            Lit::Bool(ref bool_) => self.callback(context, CallbackType::LitBool, bool_.to_token_stream()),
             Lit::Verbatim(_) => Ok(parsed.to_token_stream()),
         }?;
         Ok(result)
     }
-    pub fn lit_str(&self, tokens: TokenStream) -> Result<TokenStream> {
+    pub fn lit_str(&self, _: &Context, tokens: TokenStream) -> Result<TokenStream> {
         let parsed = parse2::<LitStr>(tokens)?;
         Ok(parsed.to_token_stream())
     }
-    pub fn lit_byte_str(&self, tokens: TokenStream) -> Result<TokenStream> {
+    pub fn lit_byte_str(&self, _: &Context, tokens: TokenStream) -> Result<TokenStream> {
         let parsed = parse2::<LitByteStr>(tokens)?;
         Ok(parsed.to_token_stream())
     }
-    pub fn lit_byte(&self, tokens: TokenStream) -> Result<TokenStream> {
+    pub fn lit_byte(&self, _: &Context, tokens: TokenStream) -> Result<TokenStream> {
         let parsed = parse2::<LitByte>(tokens)?;
         Ok(parsed.to_token_stream())
     }
-    pub fn lit_char(&self, tokens: TokenStream) -> Result<TokenStream> {
+    pub fn lit_char(&self, _: &Context, tokens: TokenStream) -> Result<TokenStream> {
         let parsed = parse2::<LitChar>(tokens)?;
         Ok(parsed.to_token_stream())
     }
-    pub fn lit_int(&self, tokens: TokenStream) -> Result<TokenStream> {
+    pub fn lit_int(&self, _: &Context, tokens: TokenStream) -> Result<TokenStream> {
         let parsed = parse2::<LitInt>(tokens)?;
         Ok(parsed.to_token_stream())
     }
-    pub fn lit_float(&self, tokens: TokenStream) -> Result<TokenStream> {
+    pub fn lit_float(&self, _: &Context, tokens: TokenStream) -> Result<TokenStream> {
         let parsed = parse2::<LitFloat>(tokens)?;
         Ok(parsed.to_token_stream())
     }
-    pub fn lit_bool(&self, tokens: TokenStream) -> Result<TokenStream> {
+    pub fn lit_bool(&self, _: &Context, tokens: TokenStream) -> Result<TokenStream> {
         let parsed = parse2::<LitBool>(tokens)?;
         Ok(parsed.to_token_stream())
     }
-    pub fn field_value(&self, tokens: TokenStream) -> Result<TokenStream> {
+    pub fn field_value(&self, context: &Context, tokens: TokenStream) -> Result<TokenStream> {
         let FieldValue {
             attrs,
             member,
             colon_token,
             expr } = parse2::<FieldValue>(tokens)?;
 
-        let new_expr = self.callback(CallbackType::Expr, expr.to_token_stream())?;
+        let new_expr = self.callback(context, CallbackType::Expr, expr.to_token_stream())?;
         
         if let Some(colon) = colon_token {
             Ok(quote! { #(#attrs)* #member #colon #new_expr })
@@ -2092,7 +2134,7 @@ impl Moisture {
             Ok(quote! { #(#attrs)* #member #new_expr })
         }
     }
-    pub fn verbatim(&self, tokens: TokenStream) -> Result<TokenStream> {
+    pub fn verbatim(&self, _: &Context, tokens: TokenStream) -> Result<TokenStream> {
         Ok(tokens)
     }
 }
