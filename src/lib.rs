@@ -1,3 +1,44 @@
+//! [`Moisture`](https://github.com/frank2/moisture) is a Rust code parsing library with a callback
+//! interface. It is based on [syn](syn), [quote](mod@quote) and [proc-macro2](proc_macro2) and is
+//! intended to be used with procedural macros.
+//!
+//! What `Moisture` does specifically is parse the entire syntax tree provided by a token stream and
+//! issue callbacks to certain objects for potential modification. A basic example:
+//!
+//! ```rust
+//! use proc_macro2::{Span, TokenStream};
+//! use quote::{quote, ToTokens};
+//! use syn::{LitStr, Result, parse2};
+//! use syn::spanned::Spanned;
+//!
+//! use moisture::*;
+//!
+//! fn str_callback(moisture: &Moisture, context: &Context, tokens: TokenStream) -> Result<TokenStream> {
+//!    let lit_str = parse2::<LitStr>(tokens.clone())?;
+//!
+//!    if lit_str.value() == "foo" { Ok(LitStr::new("bar", lit_str.span()).to_token_stream()) }
+//!    else { let result = moisture.lit_str(context, tokens)?; Ok(result) }
+//! }
+//!
+//! let mut moisture = Moisture::new();
+//! moisture.register_callback(CallbackType::LitStr, str_callback);
+//!
+//! let foo_stream = quote! { "foo" };
+//! let bar_stream = run_moisture!(moisture, CallbackType::LitStr, foo_stream);
+//! let bar_lit = parse2::<LitStr>(bar_stream).unwrap();
+//!
+//! assert_eq!(bar_lit.value(), "bar");
+//!
+//! let baz_stream = quote! { "baz" };
+//! let same_stream = run_moisture!(moisture, CallbackType::LitStr, baz_stream);
+//! let baz_lit = parse2::<LitStr>(same_stream).unwrap();
+//!
+//! assert_eq!(baz_lit.value(), "baz");
+//! ```
+//!
+//! A significant chunk of [syn](syn) types are supported. See [`CallbackType`](CallbackType) for a
+//! list of supported [syn](syn) types.
+
 use proc_macro2::{Span, TokenStream};
 
 use quote::{quote, ToTokens};
@@ -8,11 +49,11 @@ use syn::*;
 use syn::parse::Parser;
 use syn::spanned::Spanned;
 
-#[cfg(test)]
-mod tests;
-
 #[derive(Copy, Clone, Eq, PartialEq, Debug, Hash)]
 /// The type of callback to register with the [`Moisture`](Moisture) structure.
+///
+/// The enum variants map 1:1 to [syn](syn) types with the exception of [`CallbackType::Stmts`](CallbackType::Stmts),
+/// which is a convenience handler for a series of statements.
 pub enum CallbackType {
     File,
     
@@ -56,6 +97,7 @@ pub enum CallbackType {
 
     Block,
 
+    /// A series of statements. Essentially parses `Vec<syn::Stmt>`.
     Stmts,
 
     Stmt,
@@ -137,28 +179,60 @@ pub enum CallbackType {
 }
 
 #[derive(Clone, Debug)]
+/// The callback context of the given syntax callback.
+///
+/// This is essentially a stack of all callbacks and their tokens up to this point, including the current callback
+/// at the top of the stack.
 pub struct Context {
     stack: Vec<(CallbackType, TokenStream)>,
 }
 impl Context {
+    /// Creates a new `Context` object with an empty stack.
     pub fn new() -> Self {
         Self { stack: Vec::<(CallbackType, TokenStream)>::new() }
     }
+    /// Pushes the given callback and its tokens onto the callback stack.
+    ///
+    /// This function is used whenever [`Moisture::callback`](Moisture::callback) is issued.
     pub fn push(&mut self, ty: CallbackType, tokens: TokenStream) {
         self.stack.push((ty, tokens));
     }
+    /// Pops the top context off the stack.
     pub fn pop(&mut self) -> Option<(CallbackType, TokenStream)> {
         self.stack.pop()
     }
+    /// Get the context data in the stack at *distance* entries from the top of the stack.
+    ///
+    /// This is useful for determining a specific position in the callstack.
     pub fn peek(&self, distance: usize) -> Option<(CallbackType, TokenStream)> {
         if self.stack.len() == 0 || distance >= self.stack.len() { None }
         else { let entry = &self.stack[self.stack.len()-distance-1]; Some(entry.clone()) }
+    }
+    /// Get a cloned version of the current context stack.
+    pub fn get_stack(&self) -> Vec<(CallbackType, TokenStream)> {
+        self.stack.clone()
+    }
+    /// Check if there's a callback in the current callback stack.
+    ///
+    /// This ignores the top of the stack, as it's assumed the top of the stack is the callee for
+    /// determining if a callback is in the stack.
+    pub fn contains(&self, ty: CallbackType) -> bool {
+        for entry in &self.stack[..self.stack.len()-1] {
+            if entry.0 == ty { return true; }
+        }
+
+        false
     }
 }
 
 /// The callback function to register with the [`Moisture`](Moisture) structure.
 pub type Callback = fn(&Moisture, &Context, TokenStream) -> Result<TokenStream>;
 
+/// The macro to use in procedural macros when parsing with [`Moisture`](Moisture).
+///
+/// *moisture* is the [`Moisture`](Moisture) structure, *callback_ty* is the [`CallbackType`](CallbackType)
+/// to issue, and *tokens* is a [`TokenStream`](TokenStream). This effectively calls [`Moisture::callback`](Moisture::callback)
+/// and returns a compile error if an error occurred in parsing.
 #[macro_export]
 macro_rules! run_moisture {
     ($moisture:ident, $callback_ty:path, $tokens:ident) => {
@@ -169,7 +243,10 @@ macro_rules! run_moisture {
     };
 }
 
-fn get_pat_type(tokens: TokenStream) -> Result<PatType> {
+/// Get a [`PatType`](syn::PatType) object from a [`TokenStream`](TokenStream).
+///
+/// Because [syn](syn) doesn't provide this parsing functionality, a helper function is provided.
+pub fn get_pat_type(tokens: TokenStream) -> Result<PatType> {
     let stub = quote! { let #tokens ; };
     let stmt = parse2::<Stmt>(stub)?;
     let stmt_span = stmt.span().clone();
@@ -184,11 +261,16 @@ fn get_pat_type(tokens: TokenStream) -> Result<PatType> {
     else { Err(Error::new(stmt_span, "expected PatType object in Local statement pattern")) }
 }
 
+/// The structure which holds and processes the callbacks.
+///
+/// Default callbacks are 1:1 named after their [syn](syn) counterparts, with the exception of [`Moisture::stmts`](Moisture::stmts),
+/// which is a helper callback for a series of statements.
 #[derive(Clone)]
 pub struct Moisture {
     callbacks: HashMap<CallbackType, Callback>,
 }
 impl Moisture {
+    /// Create a new `Moisture` object with default callbacks registered.
     pub fn new() -> Self {
         let mut result = Self { callbacks: HashMap::<CallbackType, Callback>::new() };
         result.load_defaults();
@@ -316,9 +398,16 @@ impl Moisture {
 
         self.register_callback(CallbackType::Verbatim, Moisture::verbatim);
     }
+    /// Register a [`Callback`](Callback) for the given [`CallbackType`](CallbackType).
+    ///
+    /// This overwrites the default callback in the structure when an item is parsed.
     pub fn register_callback(&mut self, ty: CallbackType, callback: Callback) {
         self.callbacks.insert(ty, callback);
     }
+    /// Issue a callback to the given [`CallbackType`](CallbackType) to parse the given [`TokenStream`](TokenStream).
+    ///
+    /// This essentially creates a new context stack, pushes the new context onto the new stack, then issues
+    /// the call to the registered callback.
     pub fn callback(&self, context: &Context, ty: CallbackType, tokens: TokenStream) -> Result<TokenStream> {
         if let Some(callback) = self.callbacks.get(&ty) {
             let mut new_context = context.clone();
@@ -353,7 +442,6 @@ impl Moisture {
         
         Ok(tokens)
     }
-
     pub fn item(&self, context: &Context, tokens: TokenStream) -> Result<TokenStream> {
         let parsed = parse2::<Item>(tokens)?;
         
@@ -905,6 +993,10 @@ impl Moisture {
             }
         })
     }
+    /// Parse the given [`TokenStream`](TokenStream) as if it were a series of statements.
+    ///
+    /// This essentially calls [`syn::Block::parse_within`](syn::Block::parse_within) to parse the statements
+    /// and send the individual statements to the proper handler.
     pub fn stmts(&self, context: &Context, tokens: TokenStream) -> Result<TokenStream> {
         let statements = Block::parse_within.parse2(tokens)?;
         let mut new_statements = Vec::<TokenStream>::new();
